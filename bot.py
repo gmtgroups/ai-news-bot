@@ -17,6 +17,7 @@ import json
 import asyncio
 import hashlib
 import threading
+import time
 from datetime import datetime, timedelta
 from typing import Optional
 
@@ -614,7 +615,16 @@ async def send_weekly_report(app: Application):
 # ─────────────────────────────────────────────────────────────────────────────
 
 flask_app = Flask(__name__)
-CORS(flask_app)
+# Tight CORS on the Telegram proxy (origins limited to known dashboards);
+# other routes keep wide-open CORS for existing integrations.
+CORS(flask_app, resources={
+    r"/api/channel/*": {"origins": [
+        "https://clever-charisma-production-bdbe.up.railway.app",
+        "http://localhost:8765",
+        "http://127.0.0.1:8765",
+    ]},
+    r"/*": {"origins": "*"},
+})
 
 @flask_app.route("/api/stats")
 def api_stats():
@@ -644,6 +654,50 @@ def api_stats():
 @flask_app.route("/health")
 def health():
     return jsonify({"status": "ok", "bot": "ai-news"})
+
+# Server-side Telegram proxy — keeps BOT_TOKEN out of any HTML/JS served to clients.
+# Allowlist guards against arbitrary-handle enumeration; rate limit guards quota.
+_TG_PROXY_ALLOWED_HANDLES = {
+    "ainewsdailyfeeds",
+    "cryptosignalsdailyglobal",
+    "alphapulse_official",
+}
+_TG_PROXY_LOCK = threading.Lock()
+_TG_PROXY_CALLS: list[float] = []
+_TG_PROXY_WINDOW = 60.0   # seconds
+_TG_PROXY_MAX = 60        # max calls per window globally
+
+@flask_app.route("/api/channel/<handle>/members")
+def api_channel_members(handle):
+    # Flask URL-decodes once; %40-prefix already arrives as '@'. Double-encoded
+    # (%2540) input arrives as literal '%40<handle>', which fails the allowlist.
+    h = handle.lstrip("@")
+    if h not in _TG_PROXY_ALLOWED_HANDLES:
+        return jsonify({"ok": False, "error": "handle not allowed"}), 400
+    now = time.monotonic()
+    with _TG_PROXY_LOCK:
+        _TG_PROXY_CALLS[:] = [t for t in _TG_PROXY_CALLS if now - t < _TG_PROXY_WINDOW]
+        if len(_TG_PROXY_CALLS) >= _TG_PROXY_MAX:
+            return jsonify({"ok": False, "error": "rate limited"}), 429
+        _TG_PROXY_CALLS.append(now)
+    try:
+        r = httpx.get(
+            f"https://api.telegram.org/bot{BOT_TOKEN}/getChatMemberCount",
+            params={"chat_id": f"@{h}"},
+            timeout=5.0,
+        )
+        d = r.json()
+        return jsonify({"ok": bool(d.get("ok")), "result": d.get("result")})
+    except httpx.TimeoutException:
+        log.warning("Telegram getChatMemberCount timeout handle=%s", h)
+    except httpx.HTTPError as exc:
+        # Never log str(exc) — httpx errors include the full URL with BOT_TOKEN.
+        log.warning("Telegram getChatMemberCount HTTPError handle=%s type=%s",
+                    h, type(exc).__name__)
+    except Exception as exc:
+        log.warning("Unexpected error in api_channel_members handle=%s type=%s",
+                    h, type(exc).__name__)
+    return jsonify({"ok": False, "result": None}), 502
 
 @flask_app.route("/dashboard")
 @flask_app.route("/")
@@ -767,9 +821,8 @@ main{padding:32px;max-width:1200px;margin:0 auto}
 <script>
 const CRYPTO_URL='https://crypto-signals-bot-production.up.railway.app';
 const ALPHAPULSE_URL='https://alphapulse-signals-bot-production.up.railway.app';
-const TG_TOKEN='8731648888:AAF3yZltoQJwZR2pc3eLDZmR5r69W9uJmW0';
 async function getBotStats(url){try{const r=await fetch(url+'/api/stats',{signal:AbortSignal.timeout(5000)});return await r.json();}catch{return null;}}
-async function getTgMembers(handle){try{const r=await fetch('https://api.telegram.org/bot'+TG_TOKEN+'/getChatMemberCount?chat_id='+handle);const d=await r.json();return d.ok?d.result:null;}catch{return null;}}
+async function getTgMembers(handle){try{const h=handle.replace(/^@/,'');const r=await fetch('/api/channel/'+encodeURIComponent(h)+'/members',{signal:AbortSignal.timeout(5000)});const d=await r.json();return d.ok?d.result:null;}catch{return null;}}
 function fmt(n){return n===null||n===undefined?'—':n.toLocaleString();}
 function usd(n){return n===null?'—':'$'+n.toFixed(2);}
 async function refresh(){
